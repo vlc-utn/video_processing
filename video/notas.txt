@@ -1,0 +1,5 @@
+Pruebas empíricas
+
+40% IMWRITE_JPEG_QUALITY ~8 Mbps stable, ~15 Mbps peak
+40% IMWRITE_JPEG_QUALITY ~7 Mbps stable, ~14.5 Mbps peak
+40% IMWRITE_JPEG_QUALITY ~6 Mbps stable, ~11 Mbps peak

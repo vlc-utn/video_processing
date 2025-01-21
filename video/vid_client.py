@@ -23,6 +23,17 @@ class VideoClient:
         self.start_time = None
         self.frame_times = []
         self.frames_displayed = 0
+
+        self.client_socket = None
+        self.expected_packets = {}
+
+        self.target_fps = 30.0
+        self.frame_interval = 1.0 / self.target_fps
+        self.max_buffer_size = 60  
+        self.frame_buffer = Queue(maxsize=self.max_buffer_size)
+        self.last_frame_time = None
+        self.frame_count = 0
+        self.drop_threshold = 2  
         
         self.packet_decoder = VideoPacketDecoder()
         
@@ -32,8 +43,44 @@ class VideoClient:
     def connect(self):
         """Establish connection to server"""
         self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.logger.info(f"Connecting to {self.host}:{self.port}")
         self.client_socket.connect((self.host, self.port))
+
+    """
+    def adaptive_frame_timing(self):
+        current_time = time.time()
+        buffer_size = self.frame_buffer.qsize()
+        buffer_ratio = buffer_size / self.frame_buffer.maxsize
+
+        # Store statistics
+        self.stats['buffer_sizes'].append(buffer_ratio)
+        if len(self.stats['buffer_sizes']) > 30:  # Keep last second of stats
+            self.stats['buffer_sizes'].pop(0)
+
+        # Calculate average buffer ratio over last few frames
+        avg_buffer_ratio = sum(self.stats['buffer_sizes'][-5:]) / 5
+
+        # Adjust playback speed based on buffer status
+        if avg_buffer_ratio > self.buffer_high_threshold:
+            adjusted_time = self.frame_time * (1.0 - self.speed_adjustment_factor)
+        elif avg_buffer_ratio < self.buffer_low_threshold:
+            adjusted_time = self.frame_time * (1.0 + self.speed_adjustment_factor)
+        else:
+            adjusted_time = self.frame_time
+
+        return adjusted_time
+        """
+        
+        
+    def precise_sleep(self, target_time):
+        """Hybrid sleep function for precise timing"""
+        while time.time() < target_time:
+            remaining = target_time - time.time()
+            if remaining > 0.002: 
+                time.sleep(0.001)
+            else:
+                pass  
 
     def receive_exact(self, size):
         """Receive exact number of bytes by using extend if incomplete"""
@@ -51,25 +98,17 @@ class VideoClient:
         if not register_data:
             return None
             
-        registers = np.frombuffer(register_data, dtype=np.uint32)
+        #registers = np.frombuffer(register_data, dtype=np.uint32)              #Raw register values
         packet_info = self.packet_decoder.decode_registers(register_data)
         
-        """
-        # Print individual register values
-        print('\n-------------------------------')
-        print('Register 0 =', registers[0])
-        print('Register 1 =', registers[1])
-        print('Register 2 =', registers[2])
-        print('Register 3 =', registers[3])
-        
-        # Decode register information
-        packet_info = self.packet_decoder.decode_registers(register_data)
-        print(f'Frame Number: {packet_info["frame_number"]}')
-        print(f'Packet Number: {packet_info["packet_number"]}')
-        print(f'Packet Size: {packet_info["packet_size"]}')
-        print(f'Last Packet: {packet_info["is_last_packet"]}')
-        print('-------------------------------\n')
-        """
+        """     Keep for debugging
+        self.logger.info(f"------------------------------------")
+        self.logger.info(f'Frame Number: {packet_info["frame_number"]}')
+        self.logger.info(f'Packet Number: {packet_info["packet_number"]}')
+        self.logger.info(f'Packet Size: {packet_info["packet_size"]}')
+        self.logger.info(f'Last Packet: {packet_info["is_last_packet"]}')
+        self.logger.info(f"------------------------------------")
+        """       
 
         return packet_info
     
@@ -84,12 +123,12 @@ class VideoClient:
                 
                 packet_info = self.receive_registers()
                 if not packet_info:
-                    print("Recieved wrong registers")
+                    self.logger.error(f"Recieve_registers() error: {packet_info}")
                     break
                 
                 data = self.receive_packet(packet_info['packet_size'])
                 if not data:
-                    print("Recieved null data")
+                    self.logger.error(f"Recieve_packet() error: {data}")
                     break
                 
                 if self.packet_decoder.check_frame_wraparound(packet_info['frame_number']):     # Wraparound frame n°
@@ -111,65 +150,101 @@ class VideoClient:
             self.stop_event.set()
 
     def complete_frame(self):
-        """Complete current frame and add to buffer"""
+        """Modified frame handling with buffer management"""
         if not self.packet_decoder.frame_packets:
-            print("No packets to process")
             return
 
-        print(f"Processing frame with {len(self.packet_decoder.frame_packets)} packets")    
-
-        frame_data = self.packet_decoder.handle_missing_packets()           #Fill frame if missing packets
+        frame_data = self.packet_decoder.handle_missing_packets()
         if frame_data:
             try:
-                print(f"Frame data size: {len(frame_data)} bytes")
-            
-                nparr = np.frombuffer(frame_data, np.uint8)                
+                nparr = np.frombuffer(frame_data, np.uint8)
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
                 if frame is not None:
-                    print(f"Decoded frame shape: {frame.shape}")
-                    self.frame_buffer.put(frame)
-                    print(f"Current buffer size: {self.frame_buffer.qsize()}")
                     
+                    if self.frame_buffer.qsize() >= self.max_buffer_size * 0.9:
+                        try:
+                            self.frame_buffer.get_nowait()
+                            self.logger.debug("Dropped oldest frame due to full buffer")
+                        except Empty:
+                            pass
+                    
+                    self.frame_buffer.put(frame, timeout=1)
                     
                     if not self.buffer_ready.is_set() and \
-                        self.frame_buffer.qsize() >= self.frame_buffer.maxsize // 3:            # buffer ready with enough frames
-                        print("Buffer ready signal set")
+                        self.frame_buffer.qsize() >= 10:  
                         self.buffer_ready.set()
-                
-                else:
-                    print("Frame decode failed - frame is None")
                         
             except Exception as e:
-                self.logger.error(f"Error decoding frame: {e}")
-                print(f"Frame decode error: {e}")
+                self.logger.error(f"Frame decode error: {e}")
+
+    def dynamic_speed_adjustment(self):
+        """Adjust playback speed based on buffer status"""
+        buffer_percent = self.frame_buffer.qsize() / self.frame_buffer.maxsize
+        
+        if buffer_percent > 0.9:
+            return self.frame_interval * 0.95  
+        elif buffer_percent > 0.7:
+            return self.frame_interval * 0.98  
+        elif buffer_percent < 0.2:
+            return self.frame_interval * 1.05  
+        elif buffer_percent < 0.3:
+            return self.frame_interval * 1.02  
+        else:
+            return self.frame_interval  
+
 
     def display_frames(self):
-        """Display frames at target FPS"""
+        """Optimized display loop with strict timing"""
         try:
-            self.logger.info("Waiting for buffer to fill...")
+            self.logger.info("Waiting for initial buffer fill...")
             self.buffer_ready.wait()
-
-            self.logger.info("Creating display window...")
+            
             cv2.namedWindow('Video client', cv2.WINDOW_NORMAL)
-        
-            self.start_time = time.time()
-            next_frame_time = self.start_time
-
+            cv2.moveWindow('Video client', 1100, 150)
+            cv2.resizeWindow('Video client', 750, 750)
+            
+            self.last_frame_time = time.time()
+            next_frame_time = self.last_frame_time
+            frames_this_second = 0
+            last_fps_update = self.last_frame_time
+            
             while not self.stop_event.is_set():
                 
-                while time.time() < next_frame_time:            # Try to maintain frame rate
-                    time.sleep(0.001)
+                current_time = time.time()
+                frames_behind = int((current_time - next_frame_time) / self.frame_interval)
+                
+                if frames_behind >= self.drop_threshold:                        # Drop frames to catch up
+                    for _ in range(frames_behind - 1):
+                        try:
+                            self.frame_buffer.get_nowait()
+                            self.logger.debug(f"Dropped frame to catch up, {frames_behind} frames behind")
+                        except Empty:
+                            break
+                    next_frame_time = current_time 
+                
+                
+                sleep_time = next_frame_time - current_time
+                if sleep_time > 0:
+                    if sleep_time > 0.002: 
+                        time.sleep(sleep_time - 0.002)
+                    while time.time() < next_frame_time:
+                        pass
                 
                 try:
                     frame = self.frame_buffer.get_nowait()
-                    print(f"Displaying frame with shape: {frame.shape}")
                     cv2.imshow('Video client', frame)
+                    self.frame_count += 1
+                    frames_this_second += 1
                     
-                    self.frames_displayed += 1
-                    self.frame_times.append(time.time())
-                    
-                    self.print_metrics()
+                    # Update statistics
+                    if current_time - last_fps_update >= 1.0:
+                        buffer_percent = (self.frame_buffer.qsize() / self.frame_buffer.maxsize) * 100
+                        print(f"\rPlayback FPS: {frames_this_second}, "
+                              f"Buffer: {buffer_percent:.1f}%, "
+                              f"Dropped: {frames_behind if frames_behind > 0 else 0}", end="")
+                        frames_this_second = 0
+                        last_fps_update = current_time
                     
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
@@ -177,9 +252,10 @@ class VideoClient:
                 except Empty:
                     if self.stop_event.is_set():
                         break
+                    self.logger.warning("Buffer underrun")
                     continue
                 
-                next_frame_time += 1/30  # Target 30 FPS
+                next_frame_time += self.frame_interval
                 
         except Exception as e:
             self.logger.error(f"Error in display loop: {e}")
@@ -197,7 +273,7 @@ class VideoClient:
         
         print(f"\rPlayback FPS: {current_fps}, "
               f"Buffer: {buffer_percent:.1f}%, "
-              f"Frames displayed: {self.frames_displayed}", end="")         # Not visible in console with debugging prints (may change to log)
+              f"Frames displayed: {self.frames_displayed}", end="")         
 
     def run(self):
         """Main client loop"""
