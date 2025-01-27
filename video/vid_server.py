@@ -14,29 +14,13 @@ class VideoServer:
         self.video_path = video_path
         self.packet_size = packet_size
 
-        self.server_socket = None
-        self.client_socket = None
-
-        self.cap = None
         self.frame_count = 0
-        self.fps = 30
 
         self.total_bytes_sent = 0
-        self.start_time = None
         self.frame_times = []
 
-        #self.display_frame = None
-        #self.display_event = Event()
-
-        self.send_queue = Queue(maxsize=240)            # 8 seconds buffer at 30fps for network
-        self.display_queue = Queue(maxsize=120)         # 4 seconds buffer for display
-        self.stop_event = Event()
-        self.buffer_ready = Event()
-        self.buffer_low = Event()
-
-        self.min_buffer_threshold = 0.20
-        self.buffer_recovery_threshold = 0.60
-        self.current_playback_speed = 1.0
+        self.send_queue = Queue()
+        self.display_queue = Queue()
 
         self.packet_handler = VideoPacketEncoder()
 
@@ -66,136 +50,62 @@ class VideoServer:
             raise Exception(f"Error opening video file: {self.video_path}")
 
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.time_per_frame = 1/self.fps
         self.logger.info(f"Video FPS: {self.fps}")
 
     def frame_reader(self):
         """Read frames from video file and put them in queue"""
-        try:
-            while not self.stop_event.is_set():
-                ret, frame = self.cap.read()
-                if not ret:
-                    self.logger.error(f"Read() error: {ret}")
-                    break
-
-                while not self.stop_event.is_set() and self.send_queue.full():
-                    time.sleep(0.001)
-
-                try:
-                    self.display_queue.put(frame.copy(), timeout=1)
-                except Full:
-                    sec = time.strftime("%d %H:%M:%S", time.localtime())
-                    self.logger.warning(f"{sec}: Display queue full, skipping frame")
-                    continue
-
-                if not self.buffer_ready.is_set() and \
-                    self.display_queue.qsize() >= self.display_queue.maxsize * 0.8:
-                    self.logger.info("Display buffer ready")
-                    self.buffer_ready.set()
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.logger.error(f"Read() error: {ret}")
+                break
+            try:
+                self.display_queue.put(frame.copy(), timeout=1)
 
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 20])       #40% quality, fixed for now
 
-                if not ret:
-                    self.logger.error(f"Imencode() error: {ret}")
-                    continue
-
                 compressed_frame = buffer.tobytes()
-                try:
-                    self.send_queue.put(compressed_frame, timeout=1)
-                except Full:
-                    sec = time.strftime("%d %H:%M:%S", time.localtime())
-                    self.logger.warning(f"{sec}: Send queue full, skipping frame")
-                    continue
+                self.send_queue.put(compressed_frame, timeout=1)
 
-            self.logger.info("Finished reading video file")
+            except Exception as e:
+                self.logger.error(f"Error in frame reader: {e}")
 
-        except Exception as e:
-            self.logger.error(f"Error in frame reader: {e}")
-        finally:
-            self.send_queue.put(None)
-            self.display_queue.put(None)
-
-    def dynamic_frame_delay(self, buffer_percent):
-        """Calculate frame delay based on buffer status"""
-        if buffer_percent < self.min_buffer_threshold:
-
-            self.current_playback_speed = 0.8
-            if not self.buffer_low.is_set():
-                sec = time.strftime("%d %H:%M:%S", time.localtime())
-                self.logger.warning(f"{sec}: Buffer low, reducing playback speed")
-                self.buffer_low.set()
-
-        elif buffer_percent > self.buffer_recovery_threshold and self.buffer_low.is_set():
-            self.current_playback_speed = 1.0
-            self.buffer_low.clear()
-            self.logger.info("Buffer recovered, resuming normal speed")
-
-        return 1 / (self.fps * self.current_playback_speed)
+        self.logger.info("Finished reading video file")
 
     def display_frames(self):
         """Display frames from buffer with dynamic speed adjustment"""
-        try:
-            self.logger.info("Waiting for display buffer to fill...")
-            self.buffer_ready.wait()
+        self.logger.info("Waiting for display buffer to fill...")
 
-            cv2.namedWindow('Video Server', cv2.WINDOW_NORMAL)
-            cv2.moveWindow('Video Server', 250, 150)
-            cv2.resizeWindow('Video Server', 750, 750)
+        cv2.namedWindow('Video Server', cv2.WINDOW_NORMAL)
+        cv2.moveWindow('Video Server', 250, 150)
+        cv2.resizeWindow('Video Server', 750, 750)
 
-            next_frame_time = time.time()
-            frames_displayed = 0
-            display_times = []
+        previous_frame_time = time.time()
 
-            while not self.stop_event.is_set():
-                try:
-                    buffer_percent = self.display_queue.qsize() / self.display_queue.maxsize
-                    frame_delay = self.dynamic_frame_delay(buffer_percent)
+        while True:
+            # Sleep until next frame
+            if (self.time_per_frame > time.time() - previous_frame_time):
+                time.sleep(abs(self.time_per_frame - (time.time() - previous_frame_time)))
 
-                    while time.time() < next_frame_time:
-                        time.sleep(0.001)
+            try:
+                frame = self.display_queue.get(timeout=2)
+            except Empty:
+                break
 
-                    frame = self.display_queue.get_nowait()
-                    if frame is None:
-                        break
+            cv2.imshow('Video Server', frame)
+            previous_frame_time = time.time()
 
-                    cv2.imshow('Video Server', frame)
+            # Necessary for display window to work
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-                    frames_displayed += 1
-                    display_times.append(time.time())
-
-                    # Display server playback metrics
-                    """
-                    if frames_displayed % 30 == 0:
-                        recent_frames = [t for t in display_times if t > time.time() - 1]
-                        current_fps = len(recent_frames)
-                        print(f"\rDisplay FPS: {current_fps:.1f}, "
-                              f"Buffer: {buffer_percent*100:.1f}%, "
-                              f"Speed: {self.current_playback_speed:.2f}x", end="")
-                    """
-
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        self.stop_event.set()
-                        break
-
-                except Empty:
-                    if self.stop_event.is_set():
-                        break
-                    sec = time.strftime("%d %H:%M:%S", time.localtime())
-                    self.logger.warning(f"{sec}: Buffer underrun")
-                    continue
-
-                next_frame_time += frame_delay
-
-        except Exception as e:
-            self.logger.error(f"Error in display loop: {e}")
-        finally:
-            cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
 
     def send_frame(self, frame_data):
         """Split frame into packets, calculate registers and send"""
-
         try:
             send_start=time.time()
-
             for i in range(0, len(frame_data), self.packet_size):
                 packet_data = frame_data[i:i + self.packet_size]
                 is_last_packet = (i + self.packet_size) >= len(frame_data)
@@ -208,7 +118,7 @@ class VideoServer:
                 self.client_socket.sendall(registers)   #For RP, load every register individually
                 self.client_socket.sendall(packet)
 
-                self.total_bytes_sent += len(packet) + len(registers)
+                self.total_bytes_sent += len(packet)
 
             elapsed = time.time() - send_start
             if elapsed < 1/self.fps:
@@ -251,54 +161,45 @@ class VideoServer:
                 self.logger.error(f"Connection error: {e}")
                 raise
 
-            reader_thread = Thread(target=self.frame_reader)        #Use threads to generate and display frames
+            reader_thread = Thread(target=self.frame_reader)        # Use threads to generate and display frames
             display_thread = Thread(target=self.display_frames)
             reader_thread.start()
             display_thread.start()
 
             self.start_time = time.time()
-            next_frame_time = self.start_time
-
-            while not self.stop_event.is_set():
+            while True:
                 try:
-                    frame_data = self.send_queue.get()
-                    if frame_data is None:
-                        self.logger.error(f"Queue get() error: {frame_data}")
-                        break
+                    frame_data = self.send_queue.get(timeout=5)
+                except Empty:
+                    self.logger.info("No more data in video, exiting...")
+                    break
 
-                    while time.time() < next_frame_time:
-                        time.sleep(0.001)
-
-                    self.send_frame(frame_data)
-                    self.print_metrics()
-
-                    next_frame_time += 1/self.fps
-
-                except Exception as e:
-                    self.logger.error(f"Frame processing error: {e}")
-                    raise
+                self.send_frame(frame_data)
+                self.print_metrics()
 
             print("\nTransmission complete!")
 
         except Exception as e:
             self.logger.error(f"Server error: {str(e)}")
-            raise e
-        finally:
-            self.stop_event.set()
-            if self.client_socket:
+
+        reader_thread.join(timeout=10)
+        display_thread.join(timeout=10)
+
+    def __del__(self):
+        if self.client_socket:
                 self.client_socket.close()
-            if self.server_socket:
-                self.server_socket.close()
-            if self.cap:
-                self.cap.release()
-            cv2.destroyAllWindows()
+        if self.server_socket:
+            self.server_socket.close()
+        if self.cap:
+            self.cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
 
     HOST = '127.1.0.0'
     PORT = 65432
     VIDEO_PATH = './video/CiroyLosPersas.mp4'       # Replace with video path
-    PACKET_SIZE = 2048
+    PACKET_SIZE = 4011
 
     server = VideoServer(HOST, PORT, VIDEO_PATH, PACKET_SIZE)
     server.run()
