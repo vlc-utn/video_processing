@@ -7,14 +7,14 @@ from queue import Queue, Empty
 import logging
 
 class VideoClient:
-    def __init__(self, host, port, target_fps:int=25):
+    def __init__(self, host, port, initial_buffer_size=100):
         self.host = host
         self.port = port
 
-        self.frame_buffer = Queue()
-        self.time_per_frame = 1.0 / target_fps
+        self.frame_buffer = Queue(maxsize=1000)
+        self.initial_buffer_size = initial_buffer_size
 
-        logging.basicConfig(filename='./video/client_log.log', level=logging.INFO)
+        logging.basicConfig(filename='./video/client_log.log', level=logging.INFO, filemode="w")
         self.logger = logging.getLogger('VideoClient')
 
     def connect(self) -> bool:
@@ -40,6 +40,8 @@ class VideoClient:
             packet_size = regs[0] - regs[1]
             packets_in_frame = (((regs[2] >> 24) & 0b111) << 3) | ((regs[2] >> 16) & 0b111)
             packet_number = (regs[3] >> 24) & 0b111111
+            fps = (((regs[2] >> 8) & 0b111) << 2) | (regs[2] & 0b11)
+            self.time_per_frame = 1/fps
 
             # Get data
             # NOTE: here, packet size should be read, but that is internal of the FPGA
@@ -64,18 +66,21 @@ class VideoClient:
             cv2.moveWindow('Video client', 1100, 150)
             cv2.resizeWindow('Video client', 750, 750)
 
-            previous_frame_time = time.time()
+            # Wait for a little of the buffer to fill before starting to display
+            while (self.frame_buffer.qsize() < self.initial_buffer_size):
+                time.sleep(1e-3)
 
             while True:
-                if (self.time_per_frame > time.time() - previous_frame_time):
-                    time.sleep(abs(self.time_per_frame - (time.time() - previous_frame_time)))
-
                 try:
-                    frame = self.frame_buffer.get(timeout=1)
+                    frame = self.frame_buffer.get(timeout=2)
                 except Empty:
                     break
-                cv2.imshow('Video client', frame)
+
                 previous_frame_time = time.time()
+                cv2.imshow('Video client', frame)
+
+                if (self.time_per_frame > time.time() - previous_frame_time):
+                    time.sleep(abs(self.time_per_frame - (time.time() - previous_frame_time)))
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
@@ -109,5 +114,5 @@ if __name__ == "__main__":
     HOST = '127.1.0.0'
     PORT = 65432
 
-    client = VideoClient(HOST, PORT)
+    client = VideoClient(HOST, PORT, initial_buffer_size=100)
     client.run()

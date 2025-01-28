@@ -49,7 +49,7 @@ class VideoServer:
         regs[1] = payload_extra_words
 
         # Replaced FEC Concatenation Factor and repetition number with "packets_in_frame"
-        regs[2] = (((packets_in_frame >> 3) & 0b111 ) << 24) | ((packets_in_frame & 0b111) << 16) | (CONST_FEC_RATE << 8) | (CONST_BLOCK_SIZE << 0)
+        regs[2] = (((packets_in_frame >> 3) & 0b111 ) << 24) | ((packets_in_frame & 0b111) << 16) | (((self.fps >> 2) & 0b111) << 8) | ((self.fps & 0b11) << 0)
 
         # Replaced MIMO with packet number
         regs[3] = (packet_number << 24) | (CONST_CP << 16) | (CONST_BAT_ID << 8) | (CONST_SI << 0)
@@ -78,21 +78,21 @@ class VideoServer:
         if not self.cap.isOpened():
             raise Exception(f"Error opening video file: {self.video_path}")
 
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.time_per_frame = 1/fps
-        self.logger.info(f"Video FPS: {fps}")
+        self.fps = np.uint32(self.cap.get(cv2.CAP_PROP_FPS))
+        self.time_per_frame = 1/self.fps
+        self.logger.info(f"Video FPS: {self.fps}")
 
     def frame_reader(self):
         """Read frames from video file and put them in queue"""
         frame_counter = 0
-        ret = True
+        ret, frame = self.cap.read()
         while ret:
-            ret, frame = self.cap.read()
             _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self.compression])
             self.send_queue.put(buffer)
             if (self.display_video):
                 self.display_queue.put(frame)
             frame_counter += 1
+            ret, frame = self.cap.read()
 
         self.logger.info(f"Reached end of video at frame: {frame_counter}")
 
@@ -197,9 +197,9 @@ if __name__ == "__main__":
     HOST = '127.1.0.0'
     PORT = 65432
     #VIDEO_PATH = './video/CiroyLosPersas.mp4'       # Replace with video path
-    #VIDEO_PATH = "./video/SampleVideo_1280x720_30mb.mp4"
-    VIDEO_PATH = "./video/1_hour_timer.webm"
+    VIDEO_PATH = "./video/SampleVideo_1280x720_10mb.mp4"
+    #VIDEO_PATH = "./video/1_hour_timer.webm"
     PACKET_SIZE = 4011
 
-    server = VideoServer(HOST, PORT, VIDEO_PATH, PACKET_SIZE, delay_per_package=1e-3, compression=100, display_video=False)
+    server = VideoServer(HOST, PORT, VIDEO_PATH, PACKET_SIZE, delay_per_package=1e-3, compression=80, display_video=False)
     server.run()
