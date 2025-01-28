@@ -50,8 +50,9 @@ class VideoClient:
             packet_number = (regs[3] >> 24) & 0b111111
 
             # Get data
+            # NOTE: here, packet size should be read, but that is internal of the FPGA
             data = self.client_socket.recv(regs[0], socket.MSG_WAITALL)
-            data = np.frombuffer(data, np.uint8)
+            data = np.frombuffer(data[0:packet_size], np.uint8)
             if (packet_number == 0):
                 current_frame_data = data
             else:
