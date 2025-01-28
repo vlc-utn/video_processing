@@ -24,7 +24,7 @@ class VideoServer:
         self.display_video = display_video
 
         self.send_queue = Queue()       # Queue with packets to be sent
-        self.display_queue = Queue()    # Queue with frames for video visualization
+        self.display_queue = Queue(maxsize=500)    # Queue with frames for video visualization
 
         # Used to print metrics
         self.total_bytes_sent = 0
@@ -201,5 +201,5 @@ if __name__ == "__main__":
     #VIDEO_PATH = "./video/1_hour_timer.webm"
     PACKET_SIZE = 4011
 
-    server = VideoServer(HOST, PORT, VIDEO_PATH, PACKET_SIZE, delay_per_package=1e-3, compression=80, display_video=False)
+    server = VideoServer(HOST, PORT, VIDEO_PATH, PACKET_SIZE, delay_per_package=1e-3, compression=40, display_video=True)
     server.run()

@@ -11,7 +11,7 @@ class VideoClient:
         self.host = host
         self.port = port
 
-        self.frame_buffer = Queue(maxsize=1000)
+        self.frame_buffer = Queue(maxsize=500)
         self.initial_buffer_size = initial_buffer_size
 
         logging.basicConfig(filename='./video/client_log.log', level=logging.INFO, filemode="w")
