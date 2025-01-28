@@ -5,27 +5,52 @@ import time
 from threading import Thread, Event
 from queue import Queue, Empty, Full
 import logging
-from vid_classes import *
+
+CONST_FEC_BLOCK_SIZE = 21       # LDPC code block size (336 bits at output, fec rate 1/2)
+CONST_CP = 0b001                # Cyclic prefix (CONST_CP * 8)
+CONST_BAT_ID = 0b00010          # Bits per subcarrier
+CONST_SI = 0b1111               # Scrambler initialization
+CONST_FEC_RATE = 0b001          # UNUSED
+CONST_BLOCK_SIZE = 0b00         # UNUSED
 
 class VideoServer:
-    def __init__(self, host, port, video_path, packet_size=2048):
+    def __init__(self, host, port, video_path, packet_size=4011):
         self.host = host
         self.port = port
         self.video_path = video_path
         self.packet_size = packet_size
 
-        self.frame_count = 0
-
         self.total_bytes_sent = 0
-        self.frame_times = []
 
         self.send_queue = Queue()
         self.display_queue = Queue()
 
-        self.packet_handler = VideoPacketEncoder()
-
-        logging.basicConfig(filename='./video/server_log.log',level=logging.INFO)
+        logging.basicConfig(filename='./video/server_log.log',level=logging.INFO, filemode="w")
         self.logger = logging.getLogger('VideoServer')
+
+    def prepare_packet(self, data:np.ndarray[np.uint8], packet_number, packets_in_frame):
+        """Prepare packet with registers and data"""
+
+        # Append zeros to message to make it a multiple of FEC_BLOCK_SIZE
+        payload_len_in_fec_blocks = np.uint32(np.ceil(len(data)/CONST_FEC_BLOCK_SIZE))
+        payload_len_in_words = payload_len_in_fec_blocks * CONST_FEC_BLOCK_SIZE
+        payload_extra_words = payload_len_in_words - len(data)
+
+        payload_out = np.zeros(payload_len_in_words, np.uint8)
+        payload_out[0:len(data)] = data
+
+        # Form registers
+        regs = np.zeros(4, np.uint32)
+        regs[0] = payload_len_in_words
+        regs[1] = payload_extra_words
+
+        # Replaced FEC Concatenation Factor and repetition number with "packets_in_frame"
+        regs[2] = (((packets_in_frame >> 3) & 0b111 ) << 24) | ((packets_in_frame & 0b111) << 16) | (CONST_FEC_RATE << 8) | (CONST_BLOCK_SIZE << 0)
+
+        # Replaced MIMO with packet number
+        regs[3] = (packet_number << 24) | (CONST_CP << 16) | (CONST_BAT_ID << 8) | (CONST_SI << 0)
+
+        return payload_out, regs
 
     def setup_server(self):
         """Initialize server socket"""
@@ -101,97 +126,72 @@ class VideoServer:
 
         cv2.destroyAllWindows()
 
-    def send_frame(self, frame_data:np.ndarray):
+    def send_frame(self) -> bool:
         """Split frame into packets, calculate registers and send"""
+
         try:
-            send_start=time.time()
-            self.logger.info(f"Frame length in bytes: {len(frame_data)}")
-            for i in range(0, len(frame_data), self.packet_size):
-                packet_data = frame_data[i:i + self.packet_size]
-                is_last_packet = (i + self.packet_size) >= len(frame_data)
+            frame_data = np.array(self.send_queue.get(timeout=2), dtype=np.uint8)
+        except Empty:
+            self.logger.info("No more data in video, exiting...")
+            return False
 
-                registers, packet = self.packet_handler.prepare_packet(
-                    packet_data,
-                    is_last_packet
-                )
+        packets_in_frame = np.uint32(np.ceil(len(frame_data) / self.packet_size))
 
-                self.client_socket.sendall(registers)   #For RP, load every register individually
-                self.client_socket.sendall(packet)
+        for packet_number in range(0, packets_in_frame):
+            packet_data = frame_data[packet_number*self.packet_size : (packet_number+1)*self.packet_size]
 
-                self.total_bytes_sent += len(packet)
+            packet, regs = self.prepare_packet(packet_data, packet_number, packets_in_frame)
 
-            elapsed = time.time() - send_start
-            if elapsed < 1/self.fps:
-                time.sleep(1/self.fps - elapsed)
+            self.client_socket.sendall(regs)   #For RP, load every register individually
+            self.client_socket.sendall(packet)
 
-            self.frame_count += 1
-            self.frame_times.append(time.time())
-            self.packet_handler.next_frame()
+            self.total_bytes_sent += len(packet)
 
-        except Exception as e:
-            self.logger.error(f"Error sending frame: {e}")
-            raise
+        return True
+
 
     def print_metrics(self):
         """Print transmission metrics"""
         elapsed_time = time.time() - self.start_time
 
-        bitrate = (self.total_bytes_sent * 8) / elapsed_time if elapsed_time > 0 else 0
+        bitrate = (self.total_bytes_sent * 8) / elapsed_time
 
-        recent_frames = [t for t in self.frame_times if t > time.time() - 1]
-        current_fps = len(recent_frames)
-
-        print(f"\rProgress: {self.total_bytes_sent/1024/1024:.2f} MB sent, "
-              f"Bitrate: {bitrate/1024/1024:.2f} Mbps, "
-              f"FPS: {current_fps}", end="")
+        print(f"\rProgress: {self.total_bytes_sent*1e-6:.2f} MB sent, "
+              f"Bitrate: {bitrate*1e-6:.2f} Mbps", end="")
 
     def run(self):
         """Main server loop"""
+        self.setup_server()
+        self.setup_video()
+
+        print("Waiting for client connection...")
         try:
-            self.setup_server()
-            self.setup_video()
-
-            print("Waiting for client connection...")
-            try:
-                self.client_socket, addr = self.server_socket.accept()
-                self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                print(f"Connected to client at {addr}")
-                self.logger.info(f"Client connected from {addr}")
-            except Exception as e:
-                self.logger.error(f"Connection error: {e}")
-                raise
-
-            reader_thread = Thread(target=self.frame_reader)        # Use threads to generate and display frames
-            display_thread = Thread(target=self.display_frames)
-            reader_thread.start()
-            display_thread.start()
-
-            self.start_time = time.time()
-            while True:
-                try:
-                    frame_data = self.send_queue.get(timeout=5)
-                except Empty:
-                    self.logger.info("No more data in video, exiting...")
-                    break
-
-                self.send_frame(frame_data)
-                self.print_metrics()
-
-            print("\nTransmission complete!")
-
+            self.client_socket, addr = self.server_socket.accept()
+            self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            print(f"Connected to client at {addr}")
+            self.logger.info(f"Client connected from {addr}")
         except Exception as e:
-            self.logger.error(f"Server error: {str(e)}")
+            self.logger.error(f"Connection error: {e}")
+            raise
+
+        reader_thread = Thread(target=self.frame_reader)        # Use threads to generate and display frames
+        display_thread = Thread(target=self.display_frames)
+        reader_thread.start()
+        display_thread.start()
+
+        self.start_time = time.time()
+        while self.send_frame():
+            self.print_metrics()
+
+        print("\nTransmission complete!")
 
         reader_thread.join(timeout=10)
         display_thread.join(timeout=10)
 
     def __del__(self):
-        if self.client_socket:
-                self.client_socket.close()
-        if self.server_socket:
-            self.server_socket.close()
-        if self.cap:
-            self.cap.release()
+        self.client_socket.close()
+        self.server_socket.close()
+        self.cap.release()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":

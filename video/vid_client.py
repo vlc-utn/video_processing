@@ -5,7 +5,6 @@ import time
 from threading import Thread, Event
 from queue import Queue, Empty
 import logging
-from vid_classes import *
 
 class VideoClient:
     def __init__(self, host, port):
@@ -13,21 +12,15 @@ class VideoClient:
         self.port = port
 
         self.frame_buffer = Queue(120)
-        self.current_frame_data = bytearray()
 
         self.start_time = None
         self.frame_times = []
         self.frames_displayed = 0
-
-        self.expected_packets = {}
+        self.frame_packets = {}
 
         self.target_fps = 25.0
         self.time_per_frame = 1.0 / self.target_fps
         self.max_buffer_size = 60
-        self.frame_count = 0
-        self.drop_threshold = 2
-
-        self.packet_decoder = VideoPacketDecoder()
 
         logging.basicConfig(filename='./video/client_log.log', level=logging.INFO)
         self.logger = logging.getLogger('VideoClient')
@@ -45,93 +38,29 @@ class VideoClient:
             print("Couldn't connect to server. Exiting...")
             return False
 
-    def receive_exact(self, size):
-        """Receive exact number of bytes by using extend if incomplete"""
-        data = bytearray()
-        while len(data) < size:
-            packet = self.client_socket.recv(size - len(data))
-            if not packet:
-                return None
-            data.extend(packet)
-        return data
-
-    def receive_registers(self):
-        """Receive and decode register data"""
-        register_data = self.receive_exact(16)
-        if not register_data:
-            return None
-
-        #registers = np.frombuffer(register_data, dtype=np.uint32)              #Raw register values
-        packet_info = self.packet_decoder.decode_registers(register_data)
-
-        """     Keep for debugging
-        self.logger.info(f"------------------------------------")
-        self.logger.info(f'Frame Number: {packet_info["frame_number"]}')
-        self.logger.info(f'Packet Number: {packet_info["packet_number"]}')
-        self.logger.info(f'Packet Size: {packet_info["packet_size"]}')
-        self.logger.info(f'Last Packet: {packet_info["is_last_packet"]}')
-        self.logger.info(f"------------------------------------")
-        """
-
-        return packet_info
-
-    def receive_packet(self, packet_size):
-        """Receive packet data"""
-        return self.receive_exact(packet_size)
-
     def receive_frame_packets(self):
         """Receive and process incoming packets"""
-        try:
-            while True:
-                packet_info = self.receive_registers()
-                if not packet_info:
-                    self.logger.error(f"Receive_registers() error: {packet_info}")
-                    break
+        while True:
+            # Read registers
+            regs = self.client_socket.recv(16, socket.MSG_WAITALL)
+            regs = np.frombuffer(regs, np.uint32)
 
-                data = self.receive_packet(packet_info['packet_size'])
-                if not data:
-                    self.logger.error(f"Receive_packet() error: {data}")
-                    break
+            packet_size = regs[0] - regs[1]
+            packets_in_frame = (((regs[2] >> 24) & 0b111) << 3) | ((regs[2] >> 16) & 0b111)
+            packet_number = (regs[3] >> 24) & 0b111111
 
-                if self.packet_decoder.check_frame_wraparound(packet_info['frame_number']):     # Wraparound frame n°
-                    self.packet_decoder.current_frame = packet_info['frame_number']
+            # Get data
+            data = self.client_socket.recv(regs[0], socket.MSG_WAITALL)
+            data = np.frombuffer(data, np.uint8)
+            if (packet_number == 0):
+                current_frame_data = data
+            else:
+                current_frame_data = np.hstack([current_frame_data, data])
 
-                if packet_info['frame_number'] != self.packet_decoder.current_frame:            # New frame
-                    self.complete_frame()
-                    self.packet_decoder.current_frame = packet_info['frame_number']
-                    self.packet_decoder.frame_packets.clear()
-
-                self.packet_decoder.frame_packets[packet_info['packet_number']] = data
-
-                if packet_info['is_last_packet']:
-                    self.complete_frame()
-
-        except Exception as e:
-            self.logger.error(f"Error receiving packets: {e}")
-
-    def complete_frame(self):
-        """Modified frame handling with buffer management"""
-        if not self.packet_decoder.frame_packets:
-            return
-
-        frame_data = self.packet_decoder.handle_missing_packets()
-        if frame_data:
-            try:
-                nparr = np.frombuffer(frame_data, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-                if frame is not None:
-                    if self.frame_buffer.qsize() >= self.max_buffer_size * 0.9:
-                        try:
-                            self.frame_buffer.get_nowait()
-                            self.logger.debug("Dropped oldest frame due to full buffer")
-                        except Empty:
-                            pass
-
-                    self.frame_buffer.put(frame, timeout=1)
-
-            except Exception as e:
-                self.logger.error(f"Frame decode error: {e}")
+            if packet_number == packets_in_frame - 1:            # New frame
+                frame = cv2.imdecode(current_frame_data, cv2.IMREAD_COLOR)
+                current_frame_data = None
+                self.frame_buffer.put(frame, timeout=1)
 
     def display_frames(self):
         """Optimized display loop with strict timing"""
@@ -154,7 +83,6 @@ class VideoClient:
                     break
                 cv2.imshow('Video client', frame)
                 previous_frame_time = time.time()
-                self.frame_count += 1
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
@@ -179,20 +107,17 @@ class VideoClient:
         """Main client loop"""
         if not self.connect():
             return None
-        try:
-            receiver_thread = Thread(target=self.receive_frame_packets)
-            receiver_thread.start()
 
-            display_thread = Thread(target=self.display_frames)
-            display_thread.start()
+        display_thread = Thread(target=self.display_frames)
+        display_thread.start()
 
-            receiver_thread.join()
-            display_thread.join()
+        print("Entering")
+        self.receive_frame_packets()
+        print("Exiting")
 
-            print("\nPlayback complete!")
+        display_thread.join()
 
-        except Exception as e:
-            self.logger.error(f"Client error: {e}")
+        print("\nPlayback complete!")
 
     def __del__(self):
         if self.client_socket:
