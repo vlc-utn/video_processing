@@ -18,12 +18,11 @@ class VideoPacketHandler:
 class VideoPacketEncoder(VideoPacketHandler):
     """Handles packet creation and register generation for video frames"""
 
-    def __init__(self, placeholder_value=65792):
-        self.placeholder_value = placeholder_value
+    def __init__(self):
         self.frame_number = 0
         self.packet_number = 0
 
-    def calculate_reg0(self, packet_size):
+    def calculate_reg0(self, packet_size) -> np.uint32:
         """Calculate number of bytes in packet (24-bits)"""
         return np.uint32(packet_size & 0xFFFFFF)
 
@@ -39,7 +38,7 @@ class VideoPacketEncoder(VideoPacketHandler):
 
         upper_bits, lower_bits = self.split_packet_number(self.packet_number)
 
-        reg2 = self.placeholder_value
+        reg2 = 65792
 
         reg2 |= (upper_bits << 11)  # Bits [15:11]
         reg2 |= (lower_bits << 2)   # Bits [7:2]

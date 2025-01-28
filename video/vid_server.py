@@ -33,7 +33,7 @@ class VideoServer:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(1)
+            self.server_socket.listen(10)
             self.logger.info(f"Server listening on {self.host}:{self.port}")
         except socket.error as e:
             self.logger.error(f"Socket binding error: {e}")
@@ -65,8 +65,7 @@ class VideoServer:
 
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 20])       #40% quality, fixed for now
 
-                compressed_frame = buffer.tobytes()
-                self.send_queue.put(compressed_frame, timeout=1)
+                self.send_queue.put(buffer, timeout=1)
 
             except Exception as e:
                 self.logger.error(f"Error in frame reader: {e}")
@@ -102,10 +101,11 @@ class VideoServer:
 
         cv2.destroyAllWindows()
 
-    def send_frame(self, frame_data):
+    def send_frame(self, frame_data:np.ndarray):
         """Split frame into packets, calculate registers and send"""
         try:
             send_start=time.time()
+            self.logger.info(f"Frame length in bytes: {len(frame_data)}")
             for i in range(0, len(frame_data), self.packet_size):
                 packet_data = frame_data[i:i + self.packet_size]
                 is_last_packet = (i + self.packet_size) >= len(frame_data)
