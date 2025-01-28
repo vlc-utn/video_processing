@@ -14,12 +14,14 @@ CONST_FEC_RATE = 0b001          # UNUSED
 CONST_BLOCK_SIZE = 0b00         # UNUSED
 
 class VideoServer:
-    def __init__(self, host, port, video_path, packet_size=4011, delay_per_package=2e-3):
+    def __init__(self, host, port, video_path, packet_size=4011, delay_per_package=2e-3, compression=40, display_video=True):
         self.host = host                            # Host address
         self.port = port                            # Socket port
         self.video_path = video_path                # Path to video file
         self.packet_size = packet_size              # [bytes] Size of the package
         self.delay_per_package = delay_per_package  # [seg] Amount of time to wait between packages sent
+        self.compression = compression              # [%] Compression rate for the video
+        self.display_video = display_video
 
         self.send_queue = Queue()       # Queue with packets to be sent
         self.display_queue = Queue()    # Queue with frames for video visualization
@@ -83,22 +85,19 @@ class VideoServer:
     def frame_reader(self):
         """Read frames from video file and put them in queue"""
         frame_counter = 0
-        while True:
+        ret = True
+        while ret:
             ret, frame = self.cap.read()
-            if not ret:
-                self.logger.info(f"Reached end of video at frame: {frame_counter}")
-                break
+            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, self.compression])
+            self.send_queue.put(buffer)
+            if (self.display_video):
+                self.display_queue.put(frame)
             frame_counter += 1
 
-            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 40])       #40% quality, fixed for now
-            self.send_queue.put(buffer)
-            self.display_queue.put(frame.copy())
-
-        self.logger.info("Finished reading video file")
+        self.logger.info(f"Reached end of video at frame: {frame_counter}")
 
     def display_frames(self):
         """Display frames"""
-
         cv2.namedWindow('Video Server', cv2.WINDOW_NORMAL)
         cv2.moveWindow('Video Server', 250, 150)
         cv2.resizeWindow('Video Server', 750, 750)
@@ -122,7 +121,7 @@ class VideoServer:
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        cv2.destroyAllWindows()
+            print(self.display_queue.qsize())
 
     def send_frame(self) -> bool:
         """Split frame into packets, calculate registers and send"""
@@ -139,13 +138,13 @@ class VideoServer:
 
             packet, regs = self.prepare_packet(packet_data, packet_number, packets_in_frame)
 
+            # Send packet through socket
             self.client_socket.sendall(regs)
             self.client_socket.sendall(packet)
             time.sleep(self.delay_per_package)
 
             self.total_bytes_sent += len(packet)
 
-        self.logger.info(f"Sent frame: {self.frames_sent}")
         self.frames_sent += 1
         return True
 
@@ -153,7 +152,8 @@ class VideoServer:
         """Print transmission metrics"""
         bitrate = (self.total_bytes_sent * 8) / (time.time() - self.start_time)
         print(f"\rProgress: {self.total_bytes_sent*1e-6:.2f} MB sent, "
-              f"Bitrate: {bitrate*1e-6:.2f} Mbps", end="")
+              f"Bitrate: {bitrate*1e-6:.2f} Mbps, "
+              f"Frames sent: {self.frames_sent}", end="")
 
     def run(self):
         """Main server loop"""
@@ -168,12 +168,13 @@ class VideoServer:
             self.logger.info(f"Client connected from {addr}")
         except Exception as e:
             self.logger.error(f"Connection error: {e}")
-            raise
+            raise e
 
         reader_thread = Thread(target=self.frame_reader)        # Use threads to generate and display frames
-        display_thread = Thread(target=self.display_frames)
         reader_thread.start()
-        display_thread.start()
+        if (self.display_video):
+            display_thread = Thread(target=self.display_frames)
+            display_thread.start()
 
         self.start_time = time.time()
         while self.send_frame():
@@ -182,7 +183,8 @@ class VideoServer:
         self.logger.info("Waiting to join threads...")
 
         reader_thread.join()
-        display_thread.join()
+        if (self.display_video):
+            display_thread.join()
 
     def __del__(self):
         self.client_socket.close()
@@ -194,8 +196,10 @@ if __name__ == "__main__":
 
     HOST = '127.1.0.0'
     PORT = 65432
-    VIDEO_PATH = './video/CiroyLosPersas.mp4'       # Replace with video path
+    #VIDEO_PATH = './video/CiroyLosPersas.mp4'       # Replace with video path
+    #VIDEO_PATH = "./video/SampleVideo_1280x720_30mb.mp4"
+    VIDEO_PATH = "./video/1_hour_timer.webm"
     PACKET_SIZE = 4011
 
-    server = VideoServer(HOST, PORT, VIDEO_PATH, PACKET_SIZE)
+    server = VideoServer(HOST, PORT, VIDEO_PATH, PACKET_SIZE, delay_per_package=1e-3, compression=100, display_video=False)
     server.run()

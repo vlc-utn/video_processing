@@ -2,25 +2,17 @@ import socket
 import cv2
 import numpy as np
 import time
-from threading import Thread, Event
+from threading import Thread
 from queue import Queue, Empty
 import logging
 
 class VideoClient:
-    def __init__(self, host, port):
+    def __init__(self, host, port, target_fps:int=25):
         self.host = host
         self.port = port
 
-        self.frame_buffer = Queue(120)
-
-        self.start_time = None
-        self.frame_times = []
-        self.frames_displayed = 0
-        self.frame_packets = {}
-
-        self.target_fps = 25.0
-        self.time_per_frame = 1.0 / self.target_fps
-        self.max_buffer_size = 60
+        self.frame_buffer = Queue()
+        self.time_per_frame = 1.0 / target_fps
 
         logging.basicConfig(filename='./video/client_log.log', level=logging.INFO)
         self.logger = logging.getLogger('VideoClient')
@@ -61,7 +53,7 @@ class VideoClient:
             if packet_number == packets_in_frame - 1:            # New frame
                 frame = cv2.imdecode(current_frame_data, cv2.IMREAD_COLOR)
                 current_frame_data = None
-                self.frame_buffer.put(frame, timeout=1)
+                self.frame_buffer.put(frame)
 
     def display_frames(self):
         """Optimized display loop with strict timing"""
@@ -88,21 +80,12 @@ class VideoClient:
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
+                print(self.frame_buffer.qsize())
+
         except Exception as e:
             self.logger.error(f"Error in display loop: {e}")
         finally:
             cv2.destroyAllWindows()
-
-    def print_metrics(self):
-        """Print playback metrics"""
-        recent_frames = [t for t in self.frame_times if t > time.time() - 1]
-        current_fps = len(recent_frames)
-
-        buffer_percent = (self.frame_buffer.qsize() / self.frame_buffer.maxsize) * 100
-
-        print(f"\rPlayback FPS: {current_fps}, "
-              f"Buffer: {buffer_percent:.1f}%, "
-              f"Frames displayed: {self.frames_displayed}", end="")
 
     def run(self):
         """Main client loop"""
@@ -112,17 +95,14 @@ class VideoClient:
         display_thread = Thread(target=self.display_frames)
         display_thread.start()
 
-        print("Entering")
         self.receive_frame_packets()
-        print("Exiting")
 
         display_thread.join()
 
         print("\nPlayback complete!")
 
     def __del__(self):
-        if self.client_socket:
-                self.client_socket.close()
+        self.client_socket.close()
 
 if __name__ == "__main__":
 
